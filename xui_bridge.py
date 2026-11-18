@@ -62,10 +62,9 @@ def uri_to_outbound(uri: str, tag: str) -> dict:
     }
 
 
-def start_local_proxy(slots: dict):
-    if not os.path.exists(XRAY_BIN) or not slots:
+def start_local_proxy(node: dict):
+    if not os.path.exists(XRAY_BIN) or not node:
         return None, None
-    best = sorted(slots.values(), key=lambda x: x.get("speed", 0), reverse=True)[0]
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
@@ -73,7 +72,7 @@ def start_local_proxy(slots: dict):
     cfg = {
         "log": {"loglevel": "none"},
         "inbounds": [{"port": port, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": False}}],
-        "outbounds": [uri_to_outbound(best["url"], "proxy")],
+        "outbounds": [uri_to_outbound(node["url"], "proxy")],
     }
     cfg_path = f"/tmp/bridge_proxy_{port}.json"
     with open(cfg_path, "w") as f:
@@ -87,13 +86,14 @@ def start_local_proxy(slots: dict):
 def try_login(url: str, proxy_url: str | None = None):
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     sess = requests.Session(impersonate="chrome", verify=False, proxies=proxies)
-    # 1. Сначала открываем страницу панели (GET), чтобы получить куки и пройти WAF
-    sess.get(f"{url}/", timeout=15)
-    # 2. Отправляем логин и пароль
+    r_get = sess.get(f"{url}/", timeout=15)
+    print(f"[Bridge] GET {url}/ -> {r_get.status_code} (server={r_get.headers.get('server', '?')})")
     resp = sess.post(f"{url}/login", data={"username": XUI_USER, "password": XUI_PASS}, timeout=15)
-    if resp.status_code == 200 and resp.json().get("success"):
-        return sess
-    print(f"[Bridge] Отказ ({resp.status_code}) на {url} (proxy={bool(proxy_url)}): {resp.text[:150]}")
+    if resp.status_code == 200:
+        data = resp.json()
+        if data.get("success"):
+            return sess
+    print(f"[Bridge] POST {url}/login -> {resp.status_code}: {resp.text[:150]}")
     return None
 
 
@@ -119,7 +119,7 @@ def main():
     active_url = None
     xray_proc = None
 
-    # Попытка 1: прямой вход с предварительным GET
+    # 1. Пробуем прямой вход
     for url in candidate_urls:
         try:
             sess = try_login(url)
@@ -127,25 +127,33 @@ def main():
                 active_url = url
                 break
         except Exception as e:
-            print(f"[Bridge] Ошибка прямого подключения к {url}: {e}")
+            print(f"[Bridge] Ошибка прямого входа на {url}: {e}")
 
-    # Попытка 2: если IP GitHub получил 403, заходим через чистый прокси из нашего пула
+    # 2. Если H1Cloud отбил по GeoIP (403) — заходим через российский узел из _ru_proxies
     if not sess:
-        print("[Bridge] Прямой IP получил 403 — поднимаем обходной туннель через чистую ноду...")
-        xray_proc, proxy_url = start_local_proxy(slots)
-        if proxy_url:
+        ru_list = slots.get("_ru_proxies", [])
+        print(f"[Bridge] Прямой IP не прошёл — пробуем вход через RU-шлюзы ({len(ru_list)} шт.)...")
+        for idx, ru_node in enumerate(ru_list, 1):
+            proc, proxy_url = start_local_proxy(ru_node)
+            if not proxy_url:
+                continue
             for url in candidate_urls:
                 try:
                     sess = try_login(url, proxy_url=proxy_url)
                     if sess:
                         active_url = url
+                        xray_proc = proc
+                        print(f"[Bridge] Пробили вход через RU-шлюз #{idx}!")
                         break
                 except Exception as e:
-                    print(f"[Bridge] Ошибка через туннель на {url}: {e}")
+                    print(f"[Bridge] RU-шлюз #{idx} обрыв на {url}: {e}")
+            if sess:
+                break
+            proc.kill()
 
     try:
         if not sess or not active_url:
-            raise RuntimeError("Не удалось войти в 3X-UI даже через обходной туннель.")
+            raise RuntimeError("Не удалось войти в 3X-UI ни напрямую, ни через RU-шлюзы.")
 
         print(f"[Bridge] Успешный вход в 3X-UI через {active_url}!")
 
