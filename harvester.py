@@ -53,6 +53,12 @@ GOOD_SNIS = (
     "icloud.com", "office.com", "live.com", "playstation.com", "xbox.com"
 )
 
+# SNI, которые часто стоят на российских VLESS-серверах (только для служебного входа в H1Cloud)
+RU_SNIS = (
+    "yandex.ru", "ya.ru", "vk.com", "mail.ru", "ozon.ru", "wildberries.ru",
+    "dzen.ru", "rutube.ru", "ok.ru", "avito.ru", "tbank.ru", "sberbank.ru"
+)
+
 TARGET_WEBSITES = [
     "https://v2rayse.com/en/free-v2ray",
     "https://v2ray-nodes.com/",
@@ -108,7 +114,7 @@ def decode_b64(data: str) -> str:
     return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
 
 
-def is_clean_for_russia(uri: str) -> bool:
+def is_valid_vless_reality(uri: str, allow_ru_sni: bool = False) -> bool:
     if not uri.startswith("vless://"):
         return False
     try:
@@ -122,7 +128,11 @@ def is_clean_for_russia(uri: str) -> bool:
         if sec != "reality" or net not in ("tcp", "grpc") or len(pbk) < 20:
             return False
         sni = qs.get("sni", [""])[0].lower()
-        return any(good in sni for good in GOOD_SNIS)
+        if any(good in sni for good in GOOD_SNIS):
+            return True
+        if allow_ru_sni and any(ru in sni for ru in RU_SNIS):
+            return True
+        return False
     except Exception:
         return False
 
@@ -178,7 +188,7 @@ def run_curl(cmd: list[str], timeout_sec: int) -> str:
 
 
 async def test_with_xray(uri: str, min_speed: float, collect_ru: bool = False):
-    if not is_clean_for_russia(uri):
+    if not is_valid_vless_reality(uri, allow_ru_sni=collect_ru):
         return None
     parsed = uri_to_xray_outbound(uri)
     if not parsed:
@@ -207,14 +217,14 @@ async def test_with_xray(uri: str, min_speed: float, collect_ru: bool = False):
             return None
         country = loc_match.group(1).upper()
 
-        # Если поймали живой RU-узел — сохраняем как служебный прокси для входа в панель H1Cloud
         if country == "RU" and collect_ru:
             return {"url": uri, "geo": "RU", "speed": 50.0, "up": 10.0, "isp": "RU-Jump"}
 
+        if not is_valid_vless_reality(uri, allow_ru_sni=False):
+            return None
         if country in BANNED_COUNTRIES:
             return None
 
-        # Проверка отдачи (Upload >= 5 Mbps)
         up_cmd = [
             "python3", "-c",
             f"import subprocess; "
@@ -226,7 +236,6 @@ async def test_with_xray(uri: str, min_speed: float, collect_ru: bool = False):
         if up_mbps < 5.0:
             return None
 
-        # Проверка скачивания (Download)
         speed_cmd = [
             "curl", "-s", "-o", "/dev/null", "-w", "%{speed_download}",
             "-m", "5", "-x", proxy_str, "https://speed.cloudflare.com/__down?bytes=8000000"
@@ -404,7 +413,7 @@ async def scrape_sites_and_telegram(session: aiohttp.ClientSession, sem: asyncio
     return found_uris
 
 
-async def harvest_raw_nodes() -> list[str]:
+async def harvest_raw_nodes() -> tuple[list[str], list[str]]:
     saved_urls = []
     if os.path.exists(SOURCES_FILE):
         with open(SOURCES_FILE, "r", encoding="utf-8") as f:
@@ -449,10 +458,12 @@ async def harvest_raw_nodes() -> list[str]:
             if line.startswith("vless://"):
                 raw_uris.add(line)
 
-    clean_ru = [u for u in raw_uris if is_clean_for_russia(u)]
-    random.shuffle(clean_ru)
-    print(f"[Пылесос MAX] Всего VLESS: {len(raw_uris)} | Прошли фильтр РФ: {len(clean_ru)}")
-    return clean_ru[:1500]
+    clean_global = [u for u in raw_uris if is_valid_vless_reality(u, allow_ru_sni=False)]
+    ru_candidates = [u for u in raw_uris if is_valid_vless_reality(u, allow_ru_sni=True) and u not in clean_global]
+    random.shuffle(clean_global)
+    random.shuffle(ru_candidates)
+    print(f"[Пылесос MAX] Всего VLESS: {len(raw_uris)} | Мировых: {len(clean_global)} | Кандидатов в RU-шлюзы: {len(ru_candidates)}")
+    return clean_global[:1500], ru_candidates[:600]
 
 
 def set_static_title(uri: str, title: str) -> str:
@@ -486,17 +497,24 @@ async def main():
         else:
             print(f"[{code}] 💀 Ветеран сдох — ищем замену.")
 
+    # Проверяем старые RU-шлюзы
+    for old_ru in previous_slots.get("_ru_proxies", []):
+        res = await test_with_xray(old_ru["url"], 10.0, collect_ru=True)
+        if res and res["geo"] == "RU":
+            ru_proxies.append(res)
+
     missing_codes = [c for c, _ in SLOTS_CONFIG if c not in final_slots]
     donor_codes = [c for c, d in final_slots.items() if d.get("is_donor")]
 
-    if not missing_codes and not donor_codes and len(previous_slots.get("_ru_proxies", [])) >= 2:
-        print("🎉 Все слоты живы и RU-шлюзы на месте!")
-        ru_proxies = previous_slots.get("_ru_proxies", [])
+    if not missing_codes and not donor_codes and len(ru_proxies) >= 2:
+        print(f"🎉 Все слоты живы и RU-шлюзов в запасе: {len(ru_proxies)}!")
     else:
-        print(f"=== ЭТАП 2: Охота за слотами (пустых: {len(missing_codes)}, доноров: {len(donor_codes)}) ===")
-        candidates = await harvest_raw_nodes()
+        print(f"=== ЭТАП 2: Охота (пустых: {len(missing_codes)}, доноров: {len(donor_codes)}, RU-шлюзов: {len(ru_proxies)}/4) ===")
+        global_cands, ru_cands = await harvest_raw_nodes()
+        # Ставим кандидатов с RU-SNI в начало очереди, чтобы мгновенно поймать 4 RU-шлюза
+        combined = ru_cands[:120] + global_cands
         tcp_sem = asyncio.Semaphore(150)
-        alive_tcp = await asyncio.gather(*(tcp_ping(u, tcp_sem) for u in candidates))
+        alive_tcp = await asyncio.gather(*(tcp_ping(u, tcp_sem) for u in combined))
         alive_tcp = [u for u in alive_tcp if u and u not in used_urls][:MAX_CANDIDATES]
         print(f"[TCP-фильтр] Отобрано {len(alive_tcp)} живых по порту нод...")
 
@@ -556,8 +574,6 @@ async def main():
     state_to_save = dict(final_slots)
     if ru_proxies:
         state_to_save["_ru_proxies"] = ru_proxies[:4]
-    elif "_ru_proxies" in previous_slots:
-        state_to_save["_ru_proxies"] = previous_slots["_ru_proxies"][:4]
 
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state_to_save, f, indent=2, ensure_ascii=False)
