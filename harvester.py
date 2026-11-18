@@ -1,0 +1,560 @@
+import asyncio
+import base64
+import json
+import os
+import random
+import re
+import socket
+import subprocess
+import urllib.request
+import zipfile
+from urllib.parse import parse_qs, unquote, urlparse, urlunparse
+
+import aiohttp
+from bs4 import BeautifulSoup
+
+ENTRY_SPEED_MBPS = 30.0
+KEEP_SPEED_MBPS = 20.0
+MAX_CANDIDATES = 150
+STATE_FILE = "active_slots_state.json"
+SOURCES_FILE = "sources.txt"
+OUTPUT_SUB_FILE = "sub.txt"
+XRAY_BIN = "./xray"
+
+SLOTS_CONFIG = [
+    ("KZ", "🇰🇿 Казахстан • Almaty"),
+    ("DE", "🇩🇪 Германия • Frankfurt"),
+    ("NL", "🇳🇱 Нидерланды • Amsterdam"),
+    ("US", "🇺🇸 США • Virginia"),
+    ("FI", "🇫🇮 Финляндия • Helsinki"),
+    ("GB", "🇬🇧 Великобритания • London"),
+    ("FR", "🇫🇷 Франция • Paris"),
+    ("SE", "🇸🇪 Швеция • Stockholm"),
+    ("PL", "🇵🇱 Польша • Warsaw"),
+    ("JP", "🇯🇵 Япония • Tokyo"),
+    ("SG", "🇸🇬 Сингапур • Asia Hub"),
+    ("CA", "🇨🇦 Канада • Toronto"),
+    ("AT", "🇦🇹 Австрия • Vienna"),
+    ("EE", "🇪🇪 Эстония • Tallinn"),
+    ("TR", "🇹🇷 Турция • Istanbul"),
+]
+
+BANNED_ISPS = (
+    "hetzner", "digitalocean", "ovh", "contabo", "vultr", "linode",
+    "akamai", "amazon", "aws", "google", "microsoft", "oracle", "alibaba", "tencent"
+)
+
+BANNED_COUNTRIES = {"RU", "BY", "CN", "IR", "KP"}
+
+GOOD_SNIS = (
+    "microsoft.com", "apple.com", "samsung.com", "github.com", "nvidia.com",
+    "amd.com", "intel.com", "steamcommunity.com", "epicgames.com", "ea.com",
+    "bing.com", "yahoo.com", "asus.com", "logitech.com", "adobe.com", "mozilla.org",
+    "icloud.com", "office.com", "live.com", "playstation.com", "xbox.com"
+)
+
+TARGET_WEBSITES = [
+    "https://v2rayse.com/en/free-v2ray",
+    "https://v2ray-nodes.com/",
+    "https://openproxylist.com/v2ray/",
+    "https://shadowmere.xyz/",
+    "https://freefq.com/",
+    "https://nodefree.org/",
+    "https://clashnode.com/",
+    "https://v2rayshare.com/",
+    "https://oneclash.cc/",
+    "https://mibei77.com/",
+    "https://t.me/s/vless_vmess",
+    "https://t.me/s/V2rayNG_Fast",
+    "https://t.me/s/ConfigsHUB",
+    "https://t.me/s/PrivateVPNs",
+    "https://t.me/s/v2ray_outlineir",
+    "https://t.me/s/ShadowProxy66",
+    "https://t.me/s/proxy_shadosocks",
+    "https://t.me/s/Reality_Vless",
+    "https://t.me/s/free4allVPN",
+    "https://t.me/s/V2rayCollectorDonate",
+    "https://t.me/s/v2rayng_vpnrog",
+    "https://t.me/s/v2ray_free_conf",
+    "https://t.me/s/VlessConfig",
+    "https://t.me/s/v2rayngvpn",
+    "https://t.me/s/ConfigsHUB2",
+    "https://t.me/s/OutlineVpnOfficial",
+    "https://t.me/s/v2ray_configs_pool",
+    "https://t.me/s/DirectVPN",
+    "https://t.me/s/FreeV2rays",
+    "https://t.me/s/DailyV2RY",
+]
+
+
+def ensure_xray():
+    if os.path.exists(XRAY_BIN):
+        return
+    print("[Xray] Скачиваем Xray-core...")
+    url = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+    urllib.request.urlretrieve(url, "xray.zip")
+    with zipfile.ZipFile("xray.zip", "r") as zf:
+        zf.extract("xray", ".")
+    os.chmod(XRAY_BIN, 0o755)
+    os.remove("xray.zip")
+    print("[Xray] Ядро готово.")
+
+
+def decode_b64(data: str) -> str:
+    data = data.strip()
+    padding = 4 - (len(data) % 4)
+    if padding < 4:
+        data += "=" * padding
+    return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+
+
+def is_clean_for_russia(uri: str) -> bool:
+    if not uri.startswith("vless://"):
+        return False
+    try:
+        p = urlparse(uri)
+        if not p.hostname or not p.username:
+            return False
+        qs = parse_qs(p.query)
+        sec = qs.get("security", ["none"])[0]
+        net = qs.get("type", ["tcp"])[0]
+        pbk = qs.get("pbk", [""])[0]
+        if sec != "reality" or net not in ("tcp", "grpc") or len(pbk) < 20:
+            return False
+        sni = qs.get("sni", [""])[0].lower()
+        return any(good in sni for good in GOOD_SNIS)
+    except Exception:
+        return False
+
+
+def uri_to_xray_outbound(uri: str):
+    try:
+        if uri.startswith("vless://"):
+            p = urlparse(uri)
+            qs = parse_qs(p.query)
+            security = qs.get("security", ["none"])[0]
+            net = qs.get("type", ["tcp"])[0]
+            stream = {"network": net, "security": security}
+
+            if security == "reality":
+                stream["realitySettings"] = {
+                    "serverName": qs.get("sni", [""])[0],
+                    "fingerprint": qs.get("fp", ["chrome"])[0],
+                    "publicKey": qs.get("pbk", [""])[0],
+                    "shortId": qs.get("sid", [""])[0],
+                    "spiderX": unquote(qs.get("spx", ["/"])[0]),
+                }
+            if net == "grpc":
+                stream["grpcSettings"] = {"serviceName": qs.get("serviceName", [""])[0]}
+
+            return {
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": p.hostname,
+                        "port": p.port or 443,
+                        "users": [{
+                            "id": p.username,
+                            "encryption": qs.get("encryption", ["none"])[0],
+                            "flow": qs.get("flow", [""])[0],
+                        }],
+                    }]
+                },
+                "streamSettings": stream,
+            }, p.hostname, p.port or 443
+    except Exception:
+        return None
+    return None
+
+
+def get_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def run_curl(cmd: list[str], timeout_sec: int) -> str:
+    return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=timeout_sec).decode("utf-8", errors="ignore")
+
+
+async def test_with_xray(uri: str, min_speed: float):
+    if not is_clean_for_russia(uri):
+        return None
+    parsed = uri_to_xray_outbound(uri)
+    if not parsed:
+        return None
+    outbound, _, _ = parsed
+    socks_port = get_free_port()
+
+    config = {
+        "log": {"loglevel": "none"},
+        "inbounds": [{"port": socks_port, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": False}}],
+        "outbounds": [outbound],
+    }
+    cfg_path = f"/tmp/xray_{socks_port}.json"
+    with open(cfg_path, "w") as f:
+        json.dump(config, f)
+
+    proc = subprocess.Popen([XRAY_BIN, "run", "-c", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proxy_str = f"socks5h://127.0.0.1:{socks_port}"
+
+    try:
+        await asyncio.sleep(0.25)
+        trace_cmd = ["curl", "-s", "-m", "3", "-x", proxy_str, "https://www.cloudflare.com/cdn-cgi/trace"]
+        trace_out = await asyncio.to_thread(run_curl, trace_cmd, 4)
+        loc_match = re.search(r"loc=([A-Z]{2})", trace_out)
+        if not loc_match:
+            return None
+        country = loc_match.group(1).upper()
+        if country in BANNED_COUNTRIES:
+            return None
+
+        # Проверка отдачи (Upload >= 5 Mbps)
+        up_cmd = [
+            "python3", "-c",
+            f"import subprocess; "
+            f"out = subprocess.check_output(['curl', '-s', '-o', '/dev/null', '-w', '%{{speed_upload}}', '-m', '4', '-x', '{proxy_str}', '-X', 'POST', '--data-binary', '@-', 'https://speed.cloudflare.com/__up'], input=b'0'*1572864, timeout=5); "
+            f"print(out.decode())"
+        ]
+        up_out = await asyncio.to_thread(run_curl, up_cmd, 6)
+        up_mbps = (float(up_out.strip() or 0) * 8) / 1_000_000
+        if up_mbps < 5.0:
+            return None
+
+        # Проверка скачивания (Download)
+        speed_cmd = [
+            "curl", "-s", "-o", "/dev/null", "-w", "%{speed_download}",
+            "-m", "5", "-x", proxy_str, "https://speed.cloudflare.com/__down?bytes=8000000"
+        ]
+        speed_out = await asyncio.to_thread(run_curl, speed_cmd, 6)
+        down_mbps = (float(speed_out.strip() or 0) * 8) / 1_000_000
+        if down_mbps < min_speed:
+            return None
+
+        isp_name = "CleanHost"
+        try:
+            isp_cmd = ["curl", "-s", "-m", "3", "-x", proxy_str, "http://ip-api.com/json/?fields=isp,org"]
+            isp_out = await asyncio.to_thread(run_curl, isp_cmd, 4)
+            isp_json = json.loads(isp_out)
+            provider = f"{isp_json.get('isp', '')} {isp_json.get('org', '')}".lower()
+            if any(bad in provider for bad in BANNED_ISPS):
+                return None
+            isp_name = isp_json.get("isp") or isp_json.get("org") or "CleanHost"
+        except Exception:
+            pass
+
+        return {"url": uri, "geo": country, "speed": round(down_mbps, 1), "up": round(up_mbps, 1), "isp": isp_name}
+    except Exception:
+        return None
+    finally:
+        proc.kill()
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+        if os.path.exists(cfg_path):
+            os.remove(cfg_path)
+
+
+async def tcp_ping(uri: str, sem: asyncio.Semaphore):
+    parsed = uri_to_xray_outbound(uri)
+    if not parsed:
+        return None
+    _, host, port = parsed
+    async with sem:
+        try:
+            _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=1.0)
+            writer.close()
+            await writer.wait_closed()
+            return uri
+        except Exception:
+            return None
+
+
+async def fetch_source(session: aiohttp.ClientSession, url: str, sem: asyncio.Semaphore) -> str:
+    async with sem:
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                if resp.status == 200:
+                    return await resp.text()
+        except Exception:
+            pass
+        return ""
+
+
+async def discover_fresh_github_sources(session: aiohttp.ClientSession) -> list[str]:
+    token = os.getenv("GITHUB_TOKEN", "")
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "TheLastVPN-MaxHarvester"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    queries = [
+        "vless reality subscription",
+        "v2ray-configs sub txt",
+        "free vless configs",
+        "xray subscription base64",
+    ]
+    repos_to_scan = {}
+
+    for q in queries:
+        api_url = f"https://api.github.com/search/repositories?q={urllib.request.quote(q)}&sort=updated&order=desc&per_page=20"
+        try:
+            async with session.get(api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json()
+                for repo in data.get("items", []):
+                    full_name = repo.get("full_name")
+                    branch = repo.get("default_branch", "main")
+                    if full_name and full_name not in repos_to_scan:
+                        repos_to_scan[full_name] = branch
+        except Exception:
+            pass
+
+    discovered = set()
+    tree_sem = asyncio.Semaphore(15)
+
+    async def scan_repo_tree(full_name: str, branch: str):
+        async with tree_sem:
+            tree_url = f"https://api.github.com/repos/{full_name}/git/trees/{branch}?recursive=1"
+            try:
+                async with session.get(tree_url, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                    if resp.status != 200:
+                        return
+                    tree_data = await resp.json()
+                    for item in tree_data.get("tree", []):
+                        if item.get("type") != "blob":
+                            continue
+                        path = item.get("path", "")
+                        low = path.lower()
+                        if any(low.endswith(bad) for bad in [".py", ".sh", ".yml", ".yaml", ".json", ".md", ".png", ".jpg", ".js", ".go"]):
+                            continue
+                        if any(k in low for k in ["vless", "reality", "sub", "mix", "config", "all", "node", "free", "merged"]):
+                            discovered.add(f"https://raw.githubusercontent.com/{full_name}/{branch}/{path}")
+            except Exception:
+                pass
+
+    await asyncio.gather(*(scan_repo_tree(fn, br) for fn, br in list(repos_to_scan.items())[:50]))
+    print(f"[Разведка GitHub] Вскрыто реп: {len(repos_to_scan)} | Найдено подписок: {len(discovered)}")
+    return list(discovered)
+
+
+async def scrape_sites_and_telegram(session: aiohttp.ClientSession, sem: asyncio.Semaphore) -> set[str]:
+    found_uris = set()
+    extra_sub_urls = set()
+    pages = await asyncio.gather(*(fetch_source(session, site, sem) for site in TARGET_WEBSITES))
+
+    for site, html in zip(TARGET_WEBSITES, pages):
+        if not html:
+            continue
+        clean_html = html.replace("&amp;", "&")
+        for uri in re.findall(r'vless://[^\s<>"\'`]+', clean_html):
+            found_uris.add(uri.strip())
+
+        soup = BeautifulSoup(clean_html, "html.parser")
+        base_domain = "/".join(site.split("/")[:3])
+        post_links = []
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if href.startswith("/"):
+                href = base_domain + href
+            if not href.startswith("http"):
+                continue
+            if any(ext in href.lower() for ext in [".txt", "/sub", "b64sub", "export", "v2ray"]):
+                if "t.me/" not in href:
+                    extra_sub_urls.add(href)
+            elif any(k in site for k in ["nodefree", "clashnode", "freefq", "v2rayshare", "oneclash", "mibei"]) and any(
+                y in href for y in ["/2026/", "/post/", "/free-", ".html"]
+            ):
+                if href not in post_links and href != site:
+                    post_links.append(href)
+
+        for post_url in post_links[:3]:
+            post_html = await fetch_source(session, post_url, sem)
+            if post_html:
+                post_clean = post_html.replace("&amp;", "&")
+                for uri in re.findall(r'vless://[^\s<>"\'`]+', post_clean):
+                    found_uris.add(uri.strip())
+                for sub_link in re.findall(r'https?://[^\s<>"\'`]+\.txt', post_clean):
+                    extra_sub_urls.add(sub_link.strip())
+
+    if extra_sub_urls:
+        sub_pages = await asyncio.gather(*(fetch_source(session, u, sem) for u in list(extra_sub_urls)[:50]))
+        for content in sub_pages:
+            if not content:
+                continue
+            text = content
+            if "://" not in content[:100]:
+                try:
+                    text = decode_b64(content)
+                except Exception:
+                    pass
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("vless://"):
+                    found_uris.add(line)
+
+    print(f"[Сайты + TG] Прямых VLESS: {len(found_uris)} | Подписок с сайтов: {len(extra_sub_urls)}")
+    return found_uris
+
+
+async def harvest_raw_nodes() -> list[str]:
+    saved_urls = []
+    if os.path.exists(SOURCES_FILE):
+        with open(SOURCES_FILE, "r", encoding="utf-8") as f:
+            saved_urls = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+
+    sem = asyncio.Semaphore(50)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    raw_uris = set()
+    alive_urls = []
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        fresh_urls = await discover_fresh_github_sources(session)
+        web_and_tg_uris = await scrape_sites_and_telegram(session, sem)
+        raw_uris.update(web_and_tg_uris)
+
+        all_candidate_urls = list(dict.fromkeys(saved_urls + fresh_urls))[:350]
+
+        async def check_and_fetch(u: str):
+            content = await fetch_source(session, u, sem)
+            if content and len(content) > 50:
+                alive_urls.append(u)
+            return content
+
+        pages = await asyncio.gather(*(check_and_fetch(u) for u in all_candidate_urls))
+
+    if alive_urls:
+        with open(SOURCES_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(alive_urls[:350]) + "\n")
+        print(f"[Самоочистка] В sources.txt сохранено живых источников: {len(alive_urls[:350])}")
+
+    for content in pages:
+        if not content:
+            continue
+        text = content
+        if "://" not in content[:100]:
+            try:
+                text = decode_b64(content)
+            except Exception:
+                pass
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("vless://"):
+                raw_uris.add(line)
+
+    clean_ru = [u for u in raw_uris if is_clean_for_russia(u)]
+    random.shuffle(clean_ru)
+    print(f"[Пылесос MAX] Всего VLESS: {len(raw_uris)} | Прошли фильтр РФ: {len(clean_ru)}")
+    return clean_ru[:1500]
+
+
+def set_static_title(uri: str, title: str) -> str:
+    p = urlparse(uri)
+    return urlunparse((p.scheme, p.netloc, p.path, p.params, p.query, title))
+
+
+async def main():
+    ensure_xray()
+
+    previous_slots = {}
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            previous_slots = json.load(f)
+
+    final_slots = {}
+    used_urls = set()
+
+    print("=== ЭТАП 1: Проверка ветеранов ===")
+    for code, title in SLOTS_CONFIG:
+        old = previous_slots.get(code)
+        if not old:
+            continue
+        res = await test_with_xray(old["url"], KEEP_SPEED_MBPS)
+        if res:
+            old["speed"] = res["speed"]
+            final_slots[code] = old
+            used_urls.add(old["url"])
+            print(f"[{code}] 🔒 Ветеран жив (↓{res['speed']} / ↑{res['up']} Mbps) — НЕ ТРОГАЕМ!")
+        else:
+            print(f"[{code}] 💀 Ветеран сдох — ищем замену.")
+
+    missing_codes = [c for c, _ in SLOTS_CONFIG if c not in final_slots]
+    donor_codes = [c for c, d in final_slots.items() if d.get("is_donor")]
+
+    if not missing_codes and not donor_codes:
+        print("🎉 Все слоты живы и на родных странах!")
+    else:
+        print(f"=== ЭТАП 2: Охота за слотами (пустых: {len(missing_codes)}, доноров: {len(donor_codes)}) ===")
+        candidates = await harvest_raw_nodes()
+        tcp_sem = asyncio.Semaphore(150)
+        alive_tcp = await asyncio.gather(*(tcp_ping(u, tcp_sem) for u in candidates))
+        alive_tcp = [u for u in alive_tcp if u and u not in used_urls][:MAX_CANDIDATES]
+        print(f"[TCP-фильтр] Отобрано {len(alive_tcp)} живых по порту нод...")
+
+        verified_pool = []
+        xray_sem = asyncio.Semaphore(15)
+
+        async def worker(u):
+            async with xray_sem:
+                needed = len(missing_codes) + len(donor_codes)
+                found_native = sum(1 for c in (missing_codes + donor_codes) if any(v["geo"] == c for v in verified_pool))
+                if found_native >= needed and len(verified_pool) >= needed + 5:
+                    return
+                res = await test_with_xray(u, ENTRY_SPEED_MBPS)
+                if res:
+                    verified_pool.append(res)
+                    print(f"  [+] Найдена нода: [{res['geo']}] ↓{res['speed']} / ↑{res['up']} Mbps ({res['isp']})")
+
+        await asyncio.gather(*(worker(u) for u in alive_tcp))
+        verified_pool.sort(key=lambda x: x["speed"], reverse=True)
+
+        for code in donor_codes:
+            native = [v for v in verified_pool if v["geo"] == code and v["url"] not in used_urls]
+            if native:
+                used_urls.discard(final_slots[code]["url"])
+                chosen = native[0]
+                chosen["is_donor"] = False
+                final_slots[code] = chosen
+                used_urls.add(chosen["url"])
+                print(f"[{code}] ✨ Донор заменён на родную страну (↓{chosen['speed']} Mbps)!")
+
+        for code in list(missing_codes):
+            native = [v for v in verified_pool if v["geo"] == code and v["url"] not in used_urls]
+            if native:
+                chosen = native[0]
+                chosen["is_donor"] = False
+                final_slots[code] = chosen
+                used_urls.add(chosen["url"])
+                missing_codes.remove(code)
+                print(f"[{code}] ✅ Закрыт родной нодой (↓{chosen['speed']} Mbps)")
+
+        for code in list(missing_codes):
+            donors = [v for v in verified_pool if v["url"] not in used_urls]
+            if donors:
+                chosen = donors[0]
+                chosen["is_donor"] = True
+                final_slots[code] = chosen
+                used_urls.add(chosen["url"])
+                missing_codes.remove(code)
+                print(f"[{code}] 🔄 Поставлен донор из [{chosen['geo']}] (↓{chosen['speed']} Mbps)")
+
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(final_slots, f, indent=2, ensure_ascii=False)
+
+    sub_lines = []
+    for code, title in SLOTS_CONFIG:
+        if code in final_slots:
+            sub_lines.append(set_static_title(final_slots[code]["url"], title))
+
+    if sub_lines:
+        payload = "\n".join(sub_lines)
+        encoded = base64.b64encode(payload.encode("utf-8")).decode("utf-8")
+        with open(OUTPUT_SUB_FILE, "w", encoding="utf-8") as f:
+            f.write(encoded)
+        print(f"🚀 Готово! В sub.txt записано серверов: {len(sub_lines)}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
