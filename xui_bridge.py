@@ -23,6 +23,12 @@ PRIORITY_SLOTS = [
 ]
 
 
+def parse_field(val):
+    if isinstance(val, str):
+        return json.loads(val) if val.strip() else {}
+    return val or {}
+
+
 def uri_to_outbound(uri: str, tag: str) -> dict:
     p = urllib.parse.urlparse(uri)
     qs = urllib.parse.parse_qs(p.query)
@@ -59,49 +65,74 @@ def uri_to_outbound(uri: str, tag: str) -> dict:
     }
 
 
+def extract_csrf_from_html(html: str) -> str:
+    m = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+    if not m:
+        m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']csrf-token["\']', html, re.I)
+    return m.group(1).strip() if m else ""
+
+
+def fetch_csrf_token(sess, base_url: str, fallback_html: str = "") -> str:
+    token = extract_csrf_from_html(fallback_html)
+    if token:
+        return token
+
+    # Пробуем официальный эндпоинт 3X-UI v3.x: GET /csrf-token
+    try:
+        r = sess.get(f"{base_url}/csrf-token", headers={"Accept": "application/json"}, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                tok = data.get("obj") or data.get("token") or data.get("csrfToken")
+                if isinstance(tok, str) and tok.strip():
+                    return tok.strip()
+    except Exception:
+        pass
+
+    # Запасной вариант: парсим со страницы /panel/
+    try:
+        r_panel = sess.get(f"{base_url}/panel/", timeout=15)
+        token = extract_csrf_from_html(r_panel.text)
+        if token:
+            return token
+    except Exception:
+        pass
+
+    return ""
+
+
 def login_3xui(base_url: str):
     sess = requests.Session(impersonate="chrome", verify=False)
 
-    # 1. Открываем страницу входа и получаем сессионные куки
+    # 1. Открываем страницу входа, получаем куку и pre-auth CSRF-токен
     r_get = sess.get(f"{base_url}/", timeout=15)
     final_base = str(r_get.url).rstrip("/")
+    csrf_token = fetch_csrf_token(sess, final_base, r_get.text)
+    print(f"[Bridge] Получен pre-auth CSRF токен: {'да (' + str(len(csrf_token)) + ' симв.)' if csrf_token else 'нет'}")
 
-    # 2. Шлём POST /login БЕЗ Origin и Referer, чтобы 3X-UI за nginx не резал по CSRF
-    clean_headers = {
+    headers = {
         "Accept": "application/json, text/plain, */*",
     }
+    if csrf_token:
+        headers["X-CSRF-Token"] = csrf_token
 
+    # 2. Логинимся с передачей X-CSRF-Token
     resp = sess.post(
         f"{final_base}/login",
         data={"username": XUI_USER, "password": XUI_PASS},
-        headers=clean_headers,
+        headers=headers,
         timeout=15,
     )
-    if resp.status_code == 200:
-        data = resp.json()
-        if data.get("success"):
-            return sess, final_base
+    if resp.status_code != 200 or not resp.json().get("success"):
+        raise RuntimeError(f"Ошибка входа ({resp.status_code}): {resp.text[:250]}")
 
-    # Запасной вариант — JSON-формат без Origin
-    resp_json = sess.post(
-        f"{final_base}/login",
-        json={"username": XUI_USER, "password": XUI_PASS},
-        headers=clean_headers,
-        timeout=15,
-    )
-    if resp_json.status_code == 200:
-        data = resp_json.json()
-        if data.get("success"):
-            return sess, final_base
+    # 3. После логина 3X-UI ротирует сессию — забираем свежий CSRF-токен для работы с API
+    new_csrf = fetch_csrf_token(sess, final_base)
+    if new_csrf:
+        sess.headers.update({"X-CSRF-Token": new_csrf})
+        print(f"[Bridge] Обновлён post-auth CSRF токен ({len(new_csrf)} симв.)")
 
-    # Если вдруг снова отказ — выводим кусок скрипта со страницы входа для точной диагностики
-    js_hint = ""
-    m = re.search(r"axios\.post\([^)]+\)", r_get.text)
-    if m:
-        js_hint = m.group(0)
-    raise RuntimeError(
-        f"Ошибка входа ({resp.status_code}/{resp_json.status_code}): body={resp.text[:200]} | js={js_hint}"
-    )
+    return sess, final_base
 
 
 def main():
@@ -117,10 +148,10 @@ def main():
         slots = json.load(f)
 
     sess, active_url = login_3xui(XUI_URL)
-    print(f"[Bridge] Успешный вход в 3X-UI!")
+    print("[Bridge] Успешный вход в 3X-UI!")
 
     inbounds_resp = sess.get(f"{active_url}/panel/api/inbounds/list", timeout=15).json()
-    inbounds = inbounds_resp.get("obj", [])
+    inbounds = inbounds_resp.get("obj") or []
 
     base_reality = None
     base_client = None
@@ -129,10 +160,11 @@ def main():
     for ib in inbounds:
         existing_by_port[ib["port"]] = ib
         remark = ib.get("remark", "")
-        stream = json.loads(ib.get("streamSettings", "{}"))
+        stream = parse_field(ib.get("streamSettings"))
         if stream.get("security") == "reality" and stream.get("network") == "tcp" and not remark.startswith("Bridge-"):
             base_reality = stream
-            clients = json.loads(ib.get("settings", "{}")).get("clients", [])
+            settings_obj = parse_field(ib.get("settings"))
+            clients = settings_obj.get("clients", [])
             if clients:
                 base_client = clients[0]
 
@@ -202,7 +234,7 @@ def main():
         bridge_links.append(f"vless://{uuid}@{SWISS_HOST}:{port}?{params}#{urllib.parse.quote(title)}")
 
     xray_resp = sess.get(f"{active_url}/panel/xray/", timeout=15).json()
-    xray_cfg = json.loads(xray_resp["obj"]["xraySetting"])
+    xray_cfg = parse_field(xray_resp["obj"]["xraySetting"])
 
     clean_outbounds = [o for o in xray_cfg.get("outbounds", []) if not o.get("tag", "").startswith("bridge-out-")]
     xray_cfg["outbounds"] = clean_outbounds + new_outbounds
