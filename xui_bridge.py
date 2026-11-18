@@ -3,9 +3,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
-import socket
-import subprocess
-import time
 import urllib.parse
 from curl_cffi import requests
 
@@ -15,7 +12,6 @@ XUI_PASS = os.getenv("XUI_PASS", "").strip()
 
 STATE_FILE = "active_slots_state.json"
 OUTPUT_SUB_FILE = "sub.txt"
-XRAY_BIN = "./xray"
 
 SWISS_HOST = "ch5.h1cloud.net"
 BRIDGE_PORTS = [25384, 25385, 25386, 25397]
@@ -103,7 +99,6 @@ def fetch_ru_public_proxies() -> list[str]:
         except Exception:
             pass
 
-    # Сначала ставим гарантированно российские прокси, затем остальные
     seen = set()
     result = []
     for p in ru_list + other_list[:250]:
@@ -127,6 +122,10 @@ def try_login(url: str, proxy_url: str | None = None, silent: bool = False):
         "Referer": f"{final_base}/",
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
     }
 
     resp = sess.post(
@@ -143,7 +142,7 @@ def try_login(url: str, proxy_url: str | None = None, silent: bool = False):
             pass
 
     if not silent:
-        print(f"[Bridge] Отказ POST ({resp.status_code}) на {final_base}/login")
+        print(f"[Bridge] Отказ POST ({resp.status_code}) на {final_base}/login | headers={dict(resp.headers)}")
     return None, None
 
 
@@ -159,37 +158,27 @@ def main():
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         slots = json.load(f)
 
-    parsed = urllib.parse.urlparse(XUI_URL)
-    base_path = parsed.path.rstrip("/")
-    candidate_urls = [XUI_URL]
-    if "s-25373." in parsed.netloc:
-        candidate_urls.append(f"http://{SWISS_HOST}:25373{base_path}")
-
     sess = None
     active_url = None
 
-    # 1. Пробуем прямой вход
-    for url in candidate_urls:
-        try:
-            sess, active_url = try_login(url)
-            if sess:
-                break
-        except Exception as e:
-            print(f"[Bridge] Ошибка прямого входа на {url}: {e}")
+    # 1. Пробуем прямой вход по рабочей HTTPS-ссылке панели
+    try:
+        sess, active_url = try_login(XUI_URL)
+    except Exception as e:
+        print(f"[Bridge] Ошибка прямого входа: {e}")
 
-    # 2. Если сервер режет зарубежные IP — ищем рабочий RU SOCKS5/HTTP шлюз в 30 потоков
+    # 2. Если сервер режет зарубежные IP — перебираем RU SOCKS5/HTTP прокси в 35 потоков
     if not sess:
         proxies_pool = fetch_ru_public_proxies()
-        print(f"[Bridge] Прямой IP не прошёл (403) — проверяем {len(proxies_pool)} RU-прокси для входа...")
+        print(f"[Bridge] Прямой IP получил 403 — проверяем {len(proxies_pool)} RU-прокси для входа...")
 
         def probe_proxy(px: str):
-            for url in candidate_urls:
-                try:
-                    s, u = try_login(url, proxy_url=px, silent=True)
-                    if s:
-                        return s, u, px
-                except Exception:
-                    pass
+            try:
+                s, u = try_login(XUI_URL, proxy_url=px, silent=True)
+                if s:
+                    return s, u, px
+            except Exception:
+                pass
             return None
 
         with ThreadPoolExecutor(max_workers=35) as pool:
@@ -206,12 +195,15 @@ def main():
     if not sess or not active_url:
         raise RuntimeError("Не удалось войти в 3X-UI ни напрямую, ни через RU-прокси.")
 
-    print(f"[Bridge] Успешный вход в 3X-UI через {active_url}!")
+    print(f"[Bridge] Успешный вход в 3X-UI!")
     parsed_active = urllib.parse.urlparse(active_url)
     sess.headers.update({
         "Origin": f"{parsed_active.scheme}://{parsed_active.netloc}",
         "Referer": f"{active_url}/panel/",
         "X-Requested-With": "XMLHttpRequest",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
     })
 
     inbounds_resp = sess.get(f"{active_url}/panel/api/inbounds/list", timeout=15).json()
