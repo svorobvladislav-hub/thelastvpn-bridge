@@ -27,7 +27,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install aiohttp beautifulsoup4 requests
+        run: pip install aiohttp beautifulsoup4 curl_cffi
 
       - name: Run Xray Harvester
         env:
