@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 import socket
 import subprocess
 import time
@@ -86,15 +87,43 @@ def start_local_proxy(node: dict):
 def try_login(url: str, proxy_url: str | None = None):
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     sess = requests.Session(impersonate="chrome", verify=False, proxies=proxies)
+
     r_get = sess.get(f"{url}/", timeout=15)
-    print(f"[Bridge] GET {url}/ -> {r_get.status_code} (server={r_get.headers.get('server', '?')})")
-    resp = sess.post(f"{url}/login", data={"username": XUI_USER, "password": XUI_PASS}, timeout=15)
-    if resp.status_code == 200:
-        data = resp.json()
-        if data.get("success"):
-            return sess
-    print(f"[Bridge] POST {url}/login -> {resp.status_code}: {resp.text[:150]}")
-    return None
+    final_base = str(r_get.url).rstrip("/")
+    parsed_final = urllib.parse.urlparse(final_base)
+    origin = f"{parsed_final.scheme}://{parsed_final.netloc}"
+
+    ajax_headers = {
+        "Origin": origin,
+        "Referer": f"{final_base}/",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/plain, */*",
+    }
+
+    # Пробуем form-data с правильными Origin / Referer
+    resp = sess.post(
+        f"{final_base}/login",
+        data={"username": XUI_USER, "password": XUI_PASS},
+        headers=ajax_headers,
+        timeout=15,
+    )
+    if resp.status_code == 200 and resp.json().get("success"):
+        return sess, final_base
+
+    # Если не прошло — пробуем JSON payload
+    resp_json = sess.post(
+        f"{final_base}/login",
+        json={"username": XUI_USER, "password": XUI_PASS},
+        headers=ajax_headers,
+        timeout=15,
+    )
+    if resp_json.status_code == 200 and resp_json.json().get("success"):
+        return sess, final_base
+
+    title_match = re.search(r"<title>(.*?)</title>", r_get.text, re.I | re.S)
+    page_title = title_match.group(1).strip() if title_match else "no-title"
+    print(f"[Bridge] Отказ POST ({resp.status_code}/{resp_json.status_code}) на {final_base}/login | title='{page_title}' | body={resp.text[:150]}")
+    return None, None
 
 
 def main():
@@ -119,43 +148,44 @@ def main():
     active_url = None
     xray_proc = None
 
-    # 1. Пробуем прямой вход
     for url in candidate_urls:
         try:
-            sess = try_login(url)
+            sess, active_url = try_login(url)
             if sess:
-                active_url = url
                 break
         except Exception as e:
             print(f"[Bridge] Ошибка прямого входа на {url}: {e}")
 
-    # 2. Если H1Cloud отбил по GeoIP (403) — заходим через российский узел из _ru_proxies
     if not sess:
         ru_list = slots.get("_ru_proxies", [])
-        print(f"[Bridge] Прямой IP не прошёл — пробуем вход через RU-шлюзы ({len(ru_list)} шт.)...")
+        print(f"[Bridge] Пробуем вход через RU-шлюзы ({len(ru_list)} шт.)...")
         for idx, ru_node in enumerate(ru_list, 1):
             proc, proxy_url = start_local_proxy(ru_node)
             if not proxy_url:
                 continue
             for url in candidate_urls:
                 try:
-                    sess = try_login(url, proxy_url=proxy_url)
+                    sess, active_url = try_login(url, proxy_url=proxy_url)
                     if sess:
-                        active_url = url
                         xray_proc = proc
-                        print(f"[Bridge] Пробили вход через RU-шлюз #{idx}!")
                         break
                 except Exception as e:
-                    print(f"[Bridge] RU-шлюз #{idx} обрыв на {url}: {e}")
+                    print(f"[Bridge] RU-шлюз #{idx} ошибка: {e}")
             if sess:
                 break
             proc.kill()
 
     try:
         if not sess or not active_url:
-            raise RuntimeError("Не удалось войти в 3X-UI ни напрямую, ни через RU-шлюзы.")
+            raise RuntimeError("Не удалось войти в 3X-UI.")
 
         print(f"[Bridge] Успешный вход в 3X-UI через {active_url}!")
+        parsed_active = urllib.parse.urlparse(active_url)
+        sess.headers.update({
+            "Origin": f"{parsed_active.scheme}://{parsed_active.netloc}",
+            "Referer": f"{active_url}/panel/",
+            "X-Requested-With": "XMLHttpRequest",
+        })
 
         inbounds_resp = sess.get(f"{active_url}/panel/api/inbounds/list", timeout=15).json()
         inbounds = inbounds_resp.get("obj", [])
