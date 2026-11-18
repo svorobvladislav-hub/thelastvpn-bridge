@@ -1,4 +1,5 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
@@ -24,6 +25,17 @@ PRIORITY_SLOTS = [
     ("DE", "🇩🇪 Германия • Frankfurt [Bridge]"),
     ("NL", "🇳🇱 Нидерланды • Amsterdam [Bridge]"),
     ("US", "🇺🇸 США • Virginia [Bridge]"),
+]
+
+RU_PROXY_SOURCES = [
+    ("socks5", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/RU/data.txt"),
+    ("http", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt"),
+    ("socks5", "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt"),
+    ("http", "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt"),
+    ("socks5", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt"),
+    ("http", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"),
+    ("socks5", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"),
+    ("http", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"),
 ]
 
 
@@ -63,32 +75,49 @@ def uri_to_outbound(uri: str, tag: str) -> dict:
     }
 
 
-def start_local_proxy(node: dict):
-    if not os.path.exists(XRAY_BIN) or not node:
-        return None, None
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
+def fetch_ru_public_proxies() -> list[str]:
+    direct = requests.Session(impersonate="chrome")
+    ru_list = []
+    other_list = []
 
-    cfg = {
-        "log": {"loglevel": "none"},
-        "inbounds": [{"port": port, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": False}}],
-        "outbounds": [uri_to_outbound(node["url"], "proxy")],
-    }
-    cfg_path = f"/tmp/bridge_proxy_{port}.json"
-    with open(cfg_path, "w") as f:
-        json.dump(cfg, f)
+    for proto, url in RU_PROXY_SOURCES:
+        try:
+            r = direct.get(url, timeout=8)
+            if r.status_code != 200:
+                continue
+            is_ru_dedicated = "/countries/RU/" in url
+            for line in r.text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if "://" in line:
+                    p_url = line
+                elif re.match(r"^\d+\.\d+\.\d+\.\d+:\d+$", line):
+                    p_url = f"{proto}://{line}"
+                else:
+                    continue
+                if is_ru_dedicated:
+                    ru_list.append(p_url)
+                else:
+                    other_list.append(p_url)
+        except Exception:
+            pass
 
-    proc = subprocess.Popen([XRAY_BIN, "run", "-c", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(0.5)
-    return proc, f"socks5h://127.0.0.1:{port}"
+    # Сначала ставим гарантированно российские прокси, затем остальные
+    seen = set()
+    result = []
+    for p in ru_list + other_list[:250]:
+        if p not in seen:
+            seen.add(p)
+            result.append(p)
+    return result[:350]
 
 
-def try_login(url: str, proxy_url: str | None = None):
+def try_login(url: str, proxy_url: str | None = None, silent: bool = False):
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     sess = requests.Session(impersonate="chrome", verify=False, proxies=proxies)
 
-    r_get = sess.get(f"{url}/", timeout=15)
+    r_get = sess.get(f"{url}/", timeout=8)
     final_base = str(r_get.url).rstrip("/")
     parsed_final = urllib.parse.urlparse(final_base)
     origin = f"{parsed_final.scheme}://{parsed_final.netloc}"
@@ -100,29 +129,21 @@ def try_login(url: str, proxy_url: str | None = None):
         "Accept": "application/json, text/plain, */*",
     }
 
-    # Пробуем form-data с правильными Origin / Referer
     resp = sess.post(
         f"{final_base}/login",
         data={"username": XUI_USER, "password": XUI_PASS},
         headers=ajax_headers,
-        timeout=15,
+        timeout=8,
     )
-    if resp.status_code == 200 and resp.json().get("success"):
-        return sess, final_base
+    if resp.status_code == 200:
+        try:
+            if resp.json().get("success"):
+                return sess, final_base
+        except Exception:
+            pass
 
-    # Если не прошло — пробуем JSON payload
-    resp_json = sess.post(
-        f"{final_base}/login",
-        json={"username": XUI_USER, "password": XUI_PASS},
-        headers=ajax_headers,
-        timeout=15,
-    )
-    if resp_json.status_code == 200 and resp_json.json().get("success"):
-        return sess, final_base
-
-    title_match = re.search(r"<title>(.*?)</title>", r_get.text, re.I | re.S)
-    page_title = title_match.group(1).strip() if title_match else "no-title"
-    print(f"[Bridge] Отказ POST ({resp.status_code}/{resp_json.status_code}) на {final_base}/login | title='{page_title}' | body={resp.text[:150]}")
+    if not silent:
+        print(f"[Bridge] Отказ POST ({resp.status_code}) на {final_base}/login")
     return None, None
 
 
@@ -146,8 +167,8 @@ def main():
 
     sess = None
     active_url = None
-    xray_proc = None
 
+    # 1. Пробуем прямой вход
     for url in candidate_urls:
         try:
             sess, active_url = try_login(url)
@@ -156,148 +177,151 @@ def main():
         except Exception as e:
             print(f"[Bridge] Ошибка прямого входа на {url}: {e}")
 
+    # 2. Если сервер режет зарубежные IP — ищем рабочий RU SOCKS5/HTTP шлюз в 30 потоков
     if not sess:
-        ru_list = slots.get("_ru_proxies", [])
-        print(f"[Bridge] Пробуем вход через RU-шлюзы ({len(ru_list)} шт.)...")
-        for idx, ru_node in enumerate(ru_list, 1):
-            proc, proxy_url = start_local_proxy(ru_node)
-            if not proxy_url:
-                continue
+        proxies_pool = fetch_ru_public_proxies()
+        print(f"[Bridge] Прямой IP не прошёл (403) — проверяем {len(proxies_pool)} RU-прокси для входа...")
+
+        def probe_proxy(px: str):
             for url in candidate_urls:
                 try:
-                    sess, active_url = try_login(url, proxy_url=proxy_url)
-                    if sess:
-                        xray_proc = proc
-                        break
-                except Exception as e:
-                    print(f"[Bridge] RU-шлюз #{idx} ошибка: {e}")
-            if sess:
-                break
-            proc.kill()
+                    s, u = try_login(url, proxy_url=px, silent=True)
+                    if s:
+                        return s, u, px
+                except Exception:
+                    pass
+            return None
 
-    try:
-        if not sess or not active_url:
-            raise RuntimeError("Не удалось войти в 3X-UI.")
+        with ThreadPoolExecutor(max_workers=35) as pool:
+            futures = [pool.submit(probe_proxy, px) for px in proxies_pool]
+            for fut in as_completed(futures):
+                res = fut.result()
+                if res:
+                    sess, active_url, win_px = res
+                    print(f"[Bridge] Пробили вход через российский прокси: {win_px}!")
+                    for f_rem in futures:
+                        f_rem.cancel()
+                    break
 
-        print(f"[Bridge] Успешный вход в 3X-UI через {active_url}!")
-        parsed_active = urllib.parse.urlparse(active_url)
-        sess.headers.update({
-            "Origin": f"{parsed_active.scheme}://{parsed_active.netloc}",
-            "Referer": f"{active_url}/panel/",
-            "X-Requested-With": "XMLHttpRequest",
+    if not sess or not active_url:
+        raise RuntimeError("Не удалось войти в 3X-UI ни напрямую, ни через RU-прокси.")
+
+    print(f"[Bridge] Успешный вход в 3X-UI через {active_url}!")
+    parsed_active = urllib.parse.urlparse(active_url)
+    sess.headers.update({
+        "Origin": f"{parsed_active.scheme}://{parsed_active.netloc}",
+        "Referer": f"{active_url}/panel/",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+
+    inbounds_resp = sess.get(f"{active_url}/panel/api/inbounds/list", timeout=15).json()
+    inbounds = inbounds_resp.get("obj", [])
+
+    base_reality = None
+    base_client = None
+    existing_by_port = {}
+
+    for ib in inbounds:
+        existing_by_port[ib["port"]] = ib
+        remark = ib.get("remark", "")
+        stream = json.loads(ib.get("streamSettings", "{}"))
+        if stream.get("security") == "reality" and stream.get("network") == "tcp" and not remark.startswith("Bridge-"):
+            base_reality = stream
+            clients = json.loads(ib.get("settings", "{}")).get("clients", [])
+            if clients:
+                base_client = clients[0]
+
+    if not base_reality or not base_client:
+        raise RuntimeError("Не найден базовый VLESS TCP Reality inbound в панели.")
+
+    reality_cfg = base_reality["realitySettings"]
+    inner_settings = reality_cfg.get("settings", {})
+    pbk = inner_settings.get("publicKey") or reality_cfg.get("publicKey", "")
+    sni = (reality_cfg.get("serverNames") or [""])[0]
+    sid = (reality_cfg.get("shortIds") or [""])[0]
+    spx = inner_settings.get("spiderX", "/")
+    uuid = base_client["id"]
+    flow = base_client.get("flow", "xtls-rprx-vision")
+
+    bridge_links = []
+    new_outbounds = []
+    new_rules = []
+
+    available_slots = [(c, t) for c, t in PRIORITY_SLOTS if c in slots]
+    for port, (code, title) in zip(BRIDGE_PORTS, available_slots):
+        in_tag = f"inbound-{port}"
+        out_tag = f"bridge-out-{code}"
+
+        if port not in existing_by_port:
+            payload = {
+                "up": 0,
+                "down": 0,
+                "total": 0,
+                "remark": f"Bridge-{code}",
+                "enable": True,
+                "expiryTime": 0,
+                "listen": "",
+                "port": port,
+                "protocol": "vless",
+                "settings": json.dumps({
+                    "clients": [{"id": uuid, "flow": flow, "email": f"bridge_{code.lower()}", "enable": True}],
+                    "decryption": "none",
+                    "fallbacks": [],
+                }),
+                "streamSettings": json.dumps(base_reality),
+                "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"]}),
+            }
+            add_res = sess.post(f"{active_url}/panel/api/inbounds/add", data=payload, timeout=15).json()
+            if add_res.get("success"):
+                print(f"  [+] Создан мост {code} на порту {port}")
+            else:
+                print(f"  [!] Ошибка создания порта {port}: {add_res}")
+
+        new_outbounds.append(uri_to_outbound(slots[code]["url"], out_tag))
+        new_rules.append({
+            "type": "field",
+            "inboundTag": [in_tag],
+            "outboundTag": out_tag,
         })
 
-        inbounds_resp = sess.get(f"{active_url}/panel/api/inbounds/list", timeout=15).json()
-        inbounds = inbounds_resp.get("obj", [])
+        params = urllib.parse.urlencode({
+            "type": "tcp",
+            "security": "reality",
+            "pbk": pbk,
+            "fp": "firefox",
+            "sni": sni,
+            "sid": sid,
+            "spx": spx,
+            "flow": flow,
+        })
+        bridge_links.append(f"vless://{uuid}@{SWISS_HOST}:{port}?{params}#{urllib.parse.quote(title)}")
 
-        base_reality = None
-        base_client = None
-        existing_by_port = {}
+    xray_resp = sess.get(f"{active_url}/panel/xray/", timeout=15).json()
+    xray_cfg = json.loads(xray_resp["obj"]["xraySetting"])
 
-        for ib in inbounds:
-            existing_by_port[ib["port"]] = ib
-            remark = ib.get("remark", "")
-            stream = json.loads(ib.get("streamSettings", "{}"))
-            if stream.get("security") == "reality" and stream.get("network") == "tcp" and not remark.startswith("Bridge-"):
-                base_reality = stream
-                clients = json.loads(ib.get("settings", "{}")).get("clients", [])
-                if clients:
-                    base_client = clients[0]
+    clean_outbounds = [o for o in xray_cfg.get("outbounds", []) if not o.get("tag", "").startswith("bridge-out-")]
+    xray_cfg["outbounds"] = clean_outbounds + new_outbounds
 
-        if not base_reality or not base_client:
-            raise RuntimeError("Не найден базовый VLESS TCP Reality inbound в панели.")
+    routing = xray_cfg.setdefault("routing", {"domainStrategy": "AsIs", "rules": []})
+    clean_rules = [r for r in routing.get("rules", []) if not r.get("outboundTag", "").startswith("bridge-out-")]
+    routing["rules"] = new_rules + clean_rules
 
-        reality_cfg = base_reality["realitySettings"]
-        inner_settings = reality_cfg.get("settings", {})
-        pbk = inner_settings.get("publicKey") or reality_cfg.get("publicKey", "")
-        sni = (reality_cfg.get("serverNames") or [""])[0]
-        sid = (reality_cfg.get("shortIds") or [""])[0]
-        spx = inner_settings.get("spiderX", "/")
-        uuid = base_client["id"]
-        flow = base_client.get("flow", "xtls-rprx-vision")
+    upd_res = sess.post(
+        f"{active_url}/panel/xray/update",
+        data={"xraySetting": json.dumps(xray_cfg, indent=2)},
+        timeout=15,
+    ).json()
+    if not upd_res.get("success"):
+        raise RuntimeError(f"Ошибка обновления Xray: {upd_res}")
 
-        bridge_links = []
-        new_outbounds = []
-        new_rules = []
+    sess.post(f"{active_url}/panel/api/server/restartXrayService", timeout=15)
+    print(f"[Bridge] Xray перезапущен! Активно мостов: {len(new_outbounds)}")
 
-        available_slots = [(c, t) for c, t in PRIORITY_SLOTS if c in slots]
-        for port, (code, title) in zip(BRIDGE_PORTS, available_slots):
-            in_tag = f"inbound-{port}"
-            out_tag = f"bridge-out-{code}"
-
-            if port not in existing_by_port:
-                payload = {
-                    "up": 0,
-                    "down": 0,
-                    "total": 0,
-                    "remark": f"Bridge-{code}",
-                    "enable": True,
-                    "expiryTime": 0,
-                    "listen": "",
-                    "port": port,
-                    "protocol": "vless",
-                    "settings": json.dumps({
-                        "clients": [{"id": uuid, "flow": flow, "email": f"bridge_{code.lower()}", "enable": True}],
-                        "decryption": "none",
-                        "fallbacks": [],
-                    }),
-                    "streamSettings": json.dumps(base_reality),
-                    "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"]}),
-                }
-                add_res = sess.post(f"{active_url}/panel/api/inbounds/add", data=payload, timeout=15).json()
-                if add_res.get("success"):
-                    print(f"  [+] Создан мост {code} на порту {port}")
-                else:
-                    print(f"  [!] Ошибка создания порта {port}: {add_res}")
-
-            new_outbounds.append(uri_to_outbound(slots[code]["url"], out_tag))
-            new_rules.append({
-                "type": "field",
-                "inboundTag": [in_tag],
-                "outboundTag": out_tag,
-            })
-
-            params = urllib.parse.urlencode({
-                "type": "tcp",
-                "security": "reality",
-                "pbk": pbk,
-                "fp": "firefox",
-                "sni": sni,
-                "sid": sid,
-                "spx": spx,
-                "flow": flow,
-            })
-            bridge_links.append(f"vless://{uuid}@{SWISS_HOST}:{port}?{params}#{urllib.parse.quote(title)}")
-
-        xray_resp = sess.get(f"{active_url}/panel/xray/", timeout=15).json()
-        xray_cfg = json.loads(xray_resp["obj"]["xraySetting"])
-
-        clean_outbounds = [o for o in xray_cfg.get("outbounds", []) if not o.get("tag", "").startswith("bridge-out-")]
-        xray_cfg["outbounds"] = clean_outbounds + new_outbounds
-
-        routing = xray_cfg.setdefault("routing", {"domainStrategy": "AsIs", "rules": []})
-        clean_rules = [r for r in routing.get("rules", []) if not r.get("outboundTag", "").startswith("bridge-out-")]
-        routing["rules"] = new_rules + clean_rules
-
-        upd_res = sess.post(
-            f"{active_url}/panel/xray/update",
-            data={"xraySetting": json.dumps(xray_cfg, indent=2)},
-            timeout=15,
-        ).json()
-        if not upd_res.get("success"):
-            raise RuntimeError(f"Ошибка обновления Xray: {upd_res}")
-
-        sess.post(f"{active_url}/panel/api/server/restartXrayService", timeout=15)
-        print(f"[Bridge] Xray перезапущен! Активно мостов: {len(new_outbounds)}")
-
-        if bridge_links:
-            encoded = base64.b64encode("\n".join(bridge_links).encode("utf-8")).decode("utf-8")
-            with open(OUTPUT_SUB_FILE, "w", encoding="utf-8") as f:
-                f.write(encoded)
-            print(f"[Bridge] В sub.txt записано {len(bridge_links)} рабочих мостов!")
-    finally:
-        if xray_proc:
-            xray_proc.kill()
+    if bridge_links:
+        encoded = base64.b64encode("\n".join(bridge_links).encode("utf-8")).decode("utf-8")
+        with open(OUTPUT_SUB_FILE, "w", encoding="utf-8") as f:
+            f.write(encoded)
+        print(f"[Bridge] В sub.txt записано {len(bridge_links)} рабочих мостов!")
 
 
 if __name__ == "__main__":
