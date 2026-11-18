@@ -2,10 +2,7 @@ import base64
 import json
 import os
 import urllib.parse
-import requests
-import urllib3
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from curl_cffi import requests
 
 XUI_URL = os.getenv("XUI_URL", "").strip().rstrip("/")
 XUI_USER = os.getenv("XUI_USER", "").strip()
@@ -73,31 +70,32 @@ def main():
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         slots = json.load(f)
 
-    sess = requests.Session()
-    sess.verify = False
-    sess.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": f"{XUI_URL}/",
-        "Origin": f"{urllib.parse.urlparse(XUI_URL).scheme}://{urllib.parse.urlparse(XUI_URL).netloc}",
-    })
+    sess = requests.Session(impersonate="chrome", verify=False)
 
-    # 1. Пробуем вход (сначала стандартный form-data, при необходимости JSON)
-    login_url = f"{XUI_URL}/login"
-    print(f"[Bridge] Стучимся в: {login_url}")
-    login_resp = sess.post(login_url, data={"username": XUI_USER, "password": XUI_PASS}, timeout=15)
+    parsed = urllib.parse.urlparse(XUI_URL)
+    base_path = parsed.path.rstrip("/")
+    candidate_urls = [XUI_URL]
+    if "s-25373." in parsed.netloc:
+        candidate_urls.append(f"http://{SWISS_HOST}:25373{base_path}")
 
-    if not login_resp.text.strip():
-        login_resp = sess.post(login_url, json={"username": XUI_USER, "password": XUI_PASS}, timeout=15)
+    active_url = None
+    for url in candidate_urls:
+        try:
+            print(f"[Bridge] Пробуем войти через: {url}/login")
+            resp = sess.post(f"{url}/login", data={"username": XUI_USER, "password": XUI_PASS}, timeout=15)
+            if resp.status_code == 200 and resp.json().get("success"):
+                active_url = url
+                print(f"[Bridge] Успешный вход в 3X-UI через {url}!")
+                break
+            else:
+                print(f"[Bridge] Ответ ({resp.status_code}): {resp.text[:200]}")
+        except Exception as e:
+            print(f"[Bridge] Обрыв на {url}: {e}")
 
-    print(f"[Bridge] Код ответа: {login_resp.status_code} | Тело: {login_resp.text[:300]}")
-    login_data = login_resp.json()
-    if not login_data.get("success"):
-        raise RuntimeError(f"Ошибка входа в 3X-UI: {login_data}")
-    print("[Bridge] Успешный вход в 3X-UI!")
+    if not active_url:
+        raise RuntimeError("Не удалось войти в 3X-UI ни по HTTPS-прокси, ни по порту 25373.")
 
-    # 2. Ищем основной VLESS+Reality inbound (TCP)
-    inbounds_resp = sess.get(f"{XUI_URL}/panel/api/inbounds/list", timeout=15).json()
+    inbounds_resp = sess.get(f"{active_url}/panel/api/inbounds/list", timeout=15).json()
     inbounds = inbounds_resp.get("obj", [])
 
     base_reality = None
@@ -126,7 +124,6 @@ def main():
     uuid = base_client["id"]
     flow = base_client.get("flow", "xtls-rprx-vision")
 
-    # 3. Поднимаем 4 моста на свободных портах H1Cloud
     bridge_links = []
     new_outbounds = []
     new_rules = []
@@ -155,7 +152,7 @@ def main():
                 "streamSettings": json.dumps(base_reality),
                 "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"]}),
             }
-            add_res = sess.post(f"{XUI_URL}/panel/api/inbounds/add", data=payload, timeout=15).json()
+            add_res = sess.post(f"{active_url}/panel/api/inbounds/add", data=payload, timeout=15).json()
             if add_res.get("success"):
                 print(f"  [+] Создан мост {code} на порту {port}")
             else:
@@ -180,8 +177,7 @@ def main():
         })
         bridge_links.append(f"vless://{uuid}@{SWISS_HOST}:{port}?{params}#{urllib.parse.quote(title)}")
 
-    # 4. Обновляем Outbounds и Routing в шаблоне Xray и перезапускаем
-    xray_resp = sess.get(f"{XUI_URL}/panel/xray/", timeout=15).json()
+    xray_resp = sess.get(f"{active_url}/panel/xray/", timeout=15).json()
     xray_cfg = json.loads(xray_resp["obj"]["xraySetting"])
 
     clean_outbounds = [o for o in xray_cfg.get("outbounds", []) if not o.get("tag", "").startswith("bridge-out-")]
@@ -192,17 +188,16 @@ def main():
     routing["rules"] = new_rules + clean_rules
 
     upd_res = sess.post(
-        f"{XUI_URL}/panel/xray/update",
+        f"{active_url}/panel/xray/update",
         data={"xraySetting": json.dumps(xray_cfg, indent=2)},
         timeout=15,
     ).json()
     if not upd_res.get("success"):
         raise RuntimeError(f"Ошибка обновления Xray: {upd_res}")
 
-    sess.post(f"{XUI_URL}/panel/api/server/restartXrayService", timeout=15)
+    sess.post(f"{active_url}/panel/api/server/restartXrayService", timeout=15)
     print(f"[Bridge] Xray перезапущен! Активно мостов: {len(new_outbounds)}")
 
-    # 5. Записываем швейцарские мосты в sub.txt
     if bridge_links:
         encoded = base64.b64encode("\n".join(bridge_links).encode("utf-8")).decode("utf-8")
         with open(OUTPUT_SUB_FILE, "w", encoding="utf-8") as f:
