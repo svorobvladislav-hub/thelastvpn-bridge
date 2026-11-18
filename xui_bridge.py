@@ -1,5 +1,4 @@
 import base64
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
@@ -21,17 +20,6 @@ PRIORITY_SLOTS = [
     ("DE", "🇩🇪 Германия • Frankfurt [Bridge]"),
     ("NL", "🇳🇱 Нидерланды • Amsterdam [Bridge]"),
     ("US", "🇺🇸 США • Virginia [Bridge]"),
-]
-
-RU_PROXY_SOURCES = [
-    ("socks5", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/RU/data.txt"),
-    ("http", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt"),
-    ("socks5", "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt"),
-    ("http", "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt"),
-    ("socks5", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt"),
-    ("http", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"),
-    ("socks5", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"),
-    ("http", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"),
 ]
 
 
@@ -71,79 +59,49 @@ def uri_to_outbound(uri: str, tag: str) -> dict:
     }
 
 
-def fetch_ru_public_proxies() -> list[str]:
-    direct = requests.Session(impersonate="chrome")
-    ru_list = []
-    other_list = []
+def login_3xui(base_url: str):
+    sess = requests.Session(impersonate="chrome", verify=False)
 
-    for proto, url in RU_PROXY_SOURCES:
-        try:
-            r = direct.get(url, timeout=8)
-            if r.status_code != 200:
-                continue
-            is_ru_dedicated = "/countries/RU/" in url
-            for line in r.text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                if "://" in line:
-                    p_url = line
-                elif re.match(r"^\d+\.\d+\.\d+\.\d+:\d+$", line):
-                    p_url = f"{proto}://{line}"
-                else:
-                    continue
-                if is_ru_dedicated:
-                    ru_list.append(p_url)
-                else:
-                    other_list.append(p_url)
-        except Exception:
-            pass
-
-    seen = set()
-    result = []
-    for p in ru_list + other_list[:250]:
-        if p not in seen:
-            seen.add(p)
-            result.append(p)
-    return result[:350]
-
-
-def try_login(url: str, proxy_url: str | None = None, silent: bool = False):
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    sess = requests.Session(impersonate="chrome", verify=False, proxies=proxies)
-
-    r_get = sess.get(f"{url}/", timeout=8)
+    # 1. Открываем страницу входа и получаем сессионные куки
+    r_get = sess.get(f"{base_url}/", timeout=15)
     final_base = str(r_get.url).rstrip("/")
-    parsed_final = urllib.parse.urlparse(final_base)
-    origin = f"{parsed_final.scheme}://{parsed_final.netloc}"
 
-    ajax_headers = {
-        "Origin": origin,
-        "Referer": f"{final_base}/",
-        "X-Requested-With": "XMLHttpRequest",
+    # 2. Шлём POST /login БЕЗ Origin и Referer, чтобы 3X-UI за nginx не резал по CSRF
+    clean_headers = {
         "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
     }
 
     resp = sess.post(
         f"{final_base}/login",
         data={"username": XUI_USER, "password": XUI_PASS},
-        headers=ajax_headers,
-        timeout=8,
+        headers=clean_headers,
+        timeout=15,
     )
     if resp.status_code == 200:
-        try:
-            if resp.json().get("success"):
-                return sess, final_base
-        except Exception:
-            pass
+        data = resp.json()
+        if data.get("success"):
+            return sess, final_base
 
-    if not silent:
-        print(f"[Bridge] Отказ POST ({resp.status_code}) на {final_base}/login | headers={dict(resp.headers)}")
-    return None, None
+    # Запасной вариант — JSON-формат без Origin
+    resp_json = sess.post(
+        f"{final_base}/login",
+        json={"username": XUI_USER, "password": XUI_PASS},
+        headers=clean_headers,
+        timeout=15,
+    )
+    if resp_json.status_code == 200:
+        data = resp_json.json()
+        if data.get("success"):
+            return sess, final_base
+
+    # Если вдруг снова отказ — выводим кусок скрипта со страницы входа для точной диагностики
+    js_hint = ""
+    m = re.search(r"axios\.post\([^)]+\)", r_get.text)
+    if m:
+        js_hint = m.group(0)
+    raise RuntimeError(
+        f"Ошибка входа ({resp.status_code}/{resp_json.status_code}): body={resp.text[:200]} | js={js_hint}"
+    )
 
 
 def main():
@@ -158,53 +116,8 @@ def main():
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         slots = json.load(f)
 
-    sess = None
-    active_url = None
-
-    # 1. Пробуем прямой вход по рабочей HTTPS-ссылке панели
-    try:
-        sess, active_url = try_login(XUI_URL)
-    except Exception as e:
-        print(f"[Bridge] Ошибка прямого входа: {e}")
-
-    # 2. Если сервер режет зарубежные IP — перебираем RU SOCKS5/HTTP прокси в 35 потоков
-    if not sess:
-        proxies_pool = fetch_ru_public_proxies()
-        print(f"[Bridge] Прямой IP получил 403 — проверяем {len(proxies_pool)} RU-прокси для входа...")
-
-        def probe_proxy(px: str):
-            try:
-                s, u = try_login(XUI_URL, proxy_url=px, silent=True)
-                if s:
-                    return s, u, px
-            except Exception:
-                pass
-            return None
-
-        with ThreadPoolExecutor(max_workers=35) as pool:
-            futures = [pool.submit(probe_proxy, px) for px in proxies_pool]
-            for fut in as_completed(futures):
-                res = fut.result()
-                if res:
-                    sess, active_url, win_px = res
-                    print(f"[Bridge] Пробили вход через российский прокси: {win_px}!")
-                    for f_rem in futures:
-                        f_rem.cancel()
-                    break
-
-    if not sess or not active_url:
-        raise RuntimeError("Не удалось войти в 3X-UI ни напрямую, ни через RU-прокси.")
-
+    sess, active_url = login_3xui(XUI_URL)
     print(f"[Bridge] Успешный вход в 3X-UI!")
-    parsed_active = urllib.parse.urlparse(active_url)
-    sess.headers.update({
-        "Origin": f"{parsed_active.scheme}://{parsed_active.netloc}",
-        "Referer": f"{active_url}/panel/",
-        "X-Requested-With": "XMLHttpRequest",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-    })
 
     inbounds_resp = sess.get(f"{active_url}/panel/api/inbounds/list", timeout=15).json()
     inbounds = inbounds_resp.get("obj", [])
