@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 
 ENTRY_SPEED_MBPS = 30.0
 KEEP_SPEED_MBPS = 20.0
-MAX_CANDIDATES = 150
+MAX_CANDIDATES = 180
 STATE_FILE = "active_slots_state.json"
 SOURCES_FILE = "sources.txt"
 OUTPUT_SUB_FILE = "sub.txt"
@@ -177,7 +177,7 @@ def run_curl(cmd: list[str], timeout_sec: int) -> str:
     return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=timeout_sec).decode("utf-8", errors="ignore")
 
 
-async def test_with_xray(uri: str, min_speed: float):
+async def test_with_xray(uri: str, min_speed: float, collect_ru: bool = False):
     if not is_clean_for_russia(uri):
         return None
     parsed = uri_to_xray_outbound(uri)
@@ -206,6 +206,11 @@ async def test_with_xray(uri: str, min_speed: float):
         if not loc_match:
             return None
         country = loc_match.group(1).upper()
+
+        # Если поймали живой RU-узел — сохраняем как служебный прокси для входа в панель H1Cloud
+        if country == "RU" and collect_ru:
+            return {"url": uri, "geo": "RU", "speed": 50.0, "up": 10.0, "isp": "RU-Jump"}
+
         if country in BANNED_COUNTRIES:
             return None
 
@@ -465,6 +470,7 @@ async def main():
 
     final_slots = {}
     used_urls = set()
+    ru_proxies = []
 
     print("=== ЭТАП 1: Проверка ветеранов ===")
     for code, title in SLOTS_CONFIG:
@@ -483,8 +489,9 @@ async def main():
     missing_codes = [c for c, _ in SLOTS_CONFIG if c not in final_slots]
     donor_codes = [c for c, d in final_slots.items() if d.get("is_donor")]
 
-    if not missing_codes and not donor_codes:
-        print("🎉 Все слоты живы и на родных странах!")
+    if not missing_codes and not donor_codes and len(previous_slots.get("_ru_proxies", [])) >= 2:
+        print("🎉 Все слоты живы и RU-шлюзы на месте!")
+        ru_proxies = previous_slots.get("_ru_proxies", [])
     else:
         print(f"=== ЭТАП 2: Охота за слотами (пустых: {len(missing_codes)}, доноров: {len(donor_codes)}) ===")
         candidates = await harvest_raw_nodes()
@@ -498,14 +505,20 @@ async def main():
 
         async def worker(u):
             async with xray_sem:
+                need_ru = len(ru_proxies) < 4
                 needed = len(missing_codes) + len(donor_codes)
                 found_native = sum(1 for c in (missing_codes + donor_codes) if any(v["geo"] == c for v in verified_pool))
-                if found_native >= needed and len(verified_pool) >= needed + 5:
+                if not need_ru and found_native >= needed and len(verified_pool) >= needed + 5:
                     return
-                res = await test_with_xray(u, ENTRY_SPEED_MBPS)
+                res = await test_with_xray(u, ENTRY_SPEED_MBPS, collect_ru=need_ru)
                 if res:
-                    verified_pool.append(res)
-                    print(f"  [+] Найдена нода: [{res['geo']}] ↓{res['speed']} / ↑{res['up']} Mbps ({res['isp']})")
+                    if res["geo"] == "RU":
+                        if len(ru_proxies) < 4:
+                            ru_proxies.append(res)
+                            print(f"  [RU-шлюз] Найден российский узел для доступа к панели ({len(ru_proxies)}/4)")
+                    else:
+                        verified_pool.append(res)
+                        print(f"  [+] Найдена нода: [{res['geo']}] ↓{res['speed']} / ↑{res['up']} Mbps ({res['isp']})")
 
         await asyncio.gather(*(worker(u) for u in alive_tcp))
         verified_pool.sort(key=lambda x: x["speed"], reverse=True)
@@ -540,8 +553,14 @@ async def main():
                 missing_codes.remove(code)
                 print(f"[{code}] 🔄 Поставлен донор из [{chosen['geo']}] (↓{chosen['speed']} Mbps)")
 
+    state_to_save = dict(final_slots)
+    if ru_proxies:
+        state_to_save["_ru_proxies"] = ru_proxies[:4]
+    elif "_ru_proxies" in previous_slots:
+        state_to_save["_ru_proxies"] = previous_slots["_ru_proxies"][:4]
+
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(final_slots, f, indent=2, ensure_ascii=False)
+        json.dump(state_to_save, f, indent=2, ensure_ascii=False)
 
     sub_lines = []
     for code, title in SLOTS_CONFIG:
